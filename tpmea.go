@@ -13,7 +13,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"math"
 	"math/big"
 
 	"github.com/canonical/go-tpm2"
@@ -434,15 +433,19 @@ func SealSecret(handle uint32, authDigest []byte, secret []byte) error {
 		return fmt.Errorf("secret must not be empty")
 	}
 
-	if len(secret) > math.MaxUint16 {
-		return fmt.Errorf("secret too large: %d bytes exceeds TPM NV max of %d", len(secret), math.MaxUint16)
-	}
-
 	tpm, err := getTpmHandle()
 	if err != nil {
 		return err
 	}
 	defer tpm.Close()
+
+	nvBufMax, err := tpm.GetNVBufferMax()
+	if err != nil {
+		return fmt.Errorf("failed to query TPM_PT_NV_BUFFER_MAX: %w", err)
+	}
+	if len(secret) > nvBufMax {
+		return fmt.Errorf("secret too large: %d bytes exceeds TPM NV buffer max of %d", len(secret), nvBufMax)
+	}
 
 	// if the handle already exists, verify it is an ordinary NV index before
 	// overwriting it.
