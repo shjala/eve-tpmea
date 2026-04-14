@@ -309,6 +309,7 @@ func toAPINVCert(c tpmea.NVCertification) *api.NVCert {
 	return &api.NVCert{
 		Nonce:      c.Nonce,
 		AttestBlob: c.AttestBlob,
+		NVName:     c.NVName,
 		RSASig:     c.RSASig,
 		ECCSigR:    c.ECCSigR,
 		ECCSigS:    c.ECCSigS,

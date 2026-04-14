@@ -35,6 +35,12 @@ type srv struct {
 
 	// latestNonce is the last freshness token issued via /api/nonce.
 	latestNonce []byte
+
+	// nvCounterName is the TPM Name of the client's NV counter index,
+	// cached from the first successful NV counter verification. Subsequent
+	// verifications check that the attested NV Name matches, preventing
+	// index-substitution attacks.
+	nvCounterName []byte
 }
 
 func main() {
@@ -165,6 +171,7 @@ func (s *srv) handleSignPolicy(w http.ResponseWriter, r *http.Request) {
 	priv := s.privateKey
 	aikPub := s.aikPub
 	issuedNonce := s.latestNonce
+	cachedNVName := s.nvCounterName
 	s.mu.RUnlock()
 
 	rbp := fromAPIRBP(req.RBP)
@@ -175,7 +182,7 @@ func (s *srv) handleSignPolicy(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		cert := fromAPINVCert(req.NVCert)
-		certified, err := tpmea.VerifyNVCounter(&cert, aikPub, issuedNonce)
+		certified, err := tpmea.VerifyNVCounter(&cert, aikPub, issuedNonce, cachedNVName)
 		if err != nil {
 			http.Error(w, fmt.Sprintf("NV counter verification failed: %v", err), http.StatusUnauthorized)
 			return
@@ -183,6 +190,13 @@ func (s *srv) handleSignPolicy(w http.ResponseWriter, r *http.Request) {
 		if certified != req.RBP.Check {
 			http.Error(w, fmt.Sprintf("counter mismatch: certified=%d policy-check=%d", certified, req.RBP.Check), http.StatusUnauthorized)
 			return
+		}
+		// Cache the NV Name from the first successful verification so
+		// subsequent requests are bound to the same NV index.
+		if len(cachedNVName) == 0 && len(cert.NVName) > 0 {
+			s.mu.Lock()
+			s.nvCounterName = cert.NVName
+			s.mu.Unlock()
 		}
 		log.Printf("NV counter certified: value=%d", certified)
 		// Sign the next counter value - client must increment before unsealing.
@@ -247,6 +261,7 @@ func fromAPINVCert(a *api.NVCert) tpmea.NVCertification {
 	return tpmea.NVCertification{
 		Nonce:      a.Nonce,
 		AttestBlob: a.AttestBlob,
+		NVName:     a.NVName,
 		RSASig:     a.RSASig,
 		ECCSigR:    a.ECCSigR,
 		ECCSigS:    a.ECCSigS,
