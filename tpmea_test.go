@@ -20,14 +20,27 @@ import (
 )
 
 const (
-	RESETABLE_PCR_INDEX = 16
-	NV_INDEX            = 0x1500016
-	NV_COUNTER_INDEX    = 0x1500017
+	RESETABLE_PCR_INDEX     = 16
+	NV_INDEX                = 0x1500016
+	NV_COUNTER_INDEX        = 0x1500017
+	NV_COUNTER_INDEX_AUTH   = 0x1500019 // counter with index-auth mode
+	NV_WRONG_TYPE_HANDLE    = 0x1500018
 	// AIK_HANDLE is the RSA restricted signing key provisioned by runtests.sh
 	AIK_HANDLE = uint32(0x81000003)
 )
 
 var PCR_INDEXES = []int{0, 1, 2, 3, 4, 5}
+
+// counterAuthModes returns the two counter auth configurations to test.
+// Owner mode uses the existing NV_COUNTER_INDEX, index-auth mode uses a
+// separate handle so the different NV attributes don't collide.
+var counterAuthModes = []struct {
+	name string
+	rbp  func() RBP
+}{
+	{"owner", func() RBP { return RBP{Counter: NV_COUNTER_INDEX, AuthMode: CounterAuthOwner} }},
+	{"index", func() RBP { return RBP{Counter: NV_COUNTER_INDEX_AUTH, AuthMode: CounterAuthIndex, Password: []byte{}} }},
+}
 
 func TestMain(m *testing.M) {
 	if socketPath := os.Getenv("SWTPM_SERVER_PATH"); socketPath != "" {
@@ -193,19 +206,26 @@ func TestPCRExtend(t *testing.T) {
 
 // TestMonotonicCounter verifies that a monotonic counter can be defined and
 // incremented, and that its value goes up by exactly one on each increment.
+// It runs in both owner-auth and index-auth modes.
 func TestMonotonicCounter(t *testing.T) {
-	initCounter, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
-	if err != nil {
-		t.Fatalf("Expected no error, got  \"%v\"", err)
-	}
+	for _, m := range counterAuthModes {
+		t.Run(m.name, func(t *testing.T) {
+			rbp := m.rbp()
+			initCounter, err := DefineMonotonicCounter(rbp)
+			if err != nil {
+				t.Fatalf("Expected no error, got  \"%v\"", err)
+			}
 
-	updatedCounter, err := IncreaseMonotonicCounter(NV_COUNTER_INDEX)
-	if err != nil {
-		t.Fatalf("Expected no error, got  \"%v\"", err)
-	}
+			rbp.Check = initCounter
+			updatedCounter, err := IncreaseMonotonicCounter(rbp)
+			if err != nil {
+				t.Fatalf("Expected no error, got  \"%v\"", err)
+			}
 
-	if updatedCounter != (initCounter + 1) {
-		t.Fatalf("Expected counter value of %d, got %d", (initCounter + 1), updatedCounter)
+			if updatedCounter != (initCounter + 1) {
+				t.Fatalf("Expected counter value of %d, got %d", (initCounter + 1), updatedCounter)
+			}
+		})
 	}
 }
 
@@ -377,17 +397,26 @@ func testMutablePolicySealUnseal(t *testing.T, privateKey crypto.PrivateKey, pub
 // TestMutablePolicySealUnsealWithRollbackProtection* verify that rollback
 // protection works: an old policy is rejected once the counter is incremented,
 // and a new policy bound to the updated counter value restores access.
+// Each key type is tested with both owner-auth and index-auth counter modes.
 func TestMutablePolicySealUnsealWithRollbackProtectionRSA(t *testing.T) {
-	key, _ := genTpmKeyPairRSA()
-	testMutablePolicySealUnsealWithRollbackProtection(t, key, &key.PublicKey)
+	for _, m := range counterAuthModes {
+		t.Run(m.name, func(t *testing.T) {
+			key, _ := genTpmKeyPairRSA()
+			testMutablePolicySealUnsealWithRollbackProtection(t, key, &key.PublicKey, m.rbp())
+		})
+	}
 }
 
 func TestMutablePolicySealUnsealWithRollbackProtectionECC(t *testing.T) {
-	key, _ := genTpmKeyPairECC()
-	testMutablePolicySealUnsealWithRollbackProtection(t, key, &key.PublicKey)
+	for _, m := range counterAuthModes {
+		t.Run(m.name, func(t *testing.T) {
+			key, _ := genTpmKeyPairECC()
+			testMutablePolicySealUnsealWithRollbackProtection(t, key, &key.PublicKey, m.rbp())
+		})
+	}
 }
 
-func testMutablePolicySealUnsealWithRollbackProtection(t *testing.T, privateKey crypto.PrivateKey, publicKey crypto.PublicKey) {
+func testMutablePolicySealUnsealWithRollbackProtection(t *testing.T, privateKey crypto.PrivateKey, publicKey crypto.PublicKey, rbp RBP) {
 	authorizationDigest, err := GenerateAuthDigest(publicKey)
 	if err != nil {
 		t.Fatalf("Expected no error, got  \"%v\"", err)
@@ -402,11 +431,11 @@ func testMutablePolicySealUnsealWithRollbackProtection(t *testing.T, privateKey 
 		}
 	}
 
-	rbpCounter, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	rbpCounter, err := DefineMonotonicCounter(rbp)
 	if err != nil {
 		t.Fatalf("Expected no error, got  \"%v\"", err)
 	}
-	rbp := RBP{Counter: NV_COUNTER_INDEX, Check: rbpCounter}
+	rbp.Check = rbpCounter
 
 	pcrs, err := readPCRs(PCR_INDEXES, AlgoSHA256)
 	if err != nil {
@@ -483,7 +512,7 @@ func testMutablePolicySealUnsealWithRollbackProtection(t *testing.T, privateKey 
 	}
 
 	// now lets increase the counter
-	rbpCounter, err = IncreaseMonotonicCounter(NV_COUNTER_INDEX)
+	rbpCounter, err = IncreaseMonotonicCounter(rbp)
 	if err != nil {
 		t.Fatalf("Expected no error, got  \"%v\"", err)
 	}
@@ -733,7 +762,8 @@ func testUnsealSecretTamperedSignature(t *testing.T, privateKey crypto.PrivateKe
 // TestSealSecretRejectsCounterHandle verifies that SealSecret refuses to
 // overwrite a monotonic counter NV index.
 func TestSealSecretRejectsCounterHandle(t *testing.T) {
-	_, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	rbp := RBP{Counter: NV_COUNTER_INDEX}
+	_, err := DefineMonotonicCounter(rbp)
 	if err != nil {
 		t.Fatalf("Expected no error, got  \"%v\"", err)
 	}
@@ -748,26 +778,29 @@ func TestSealSecretRejectsCounterHandle(t *testing.T) {
 // DefineMonotonicCounter twice on the same handle succeeds and returns the
 // same value both times (no spurious increment on the second call).
 func TestDefineMonotonicCounterIdempotent(t *testing.T) {
-	counter1, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
-	if err != nil {
-		t.Fatalf("Expected no error, got  \"%v\"", err)
-	}
+	for _, m := range counterAuthModes {
+		t.Run(m.name, func(t *testing.T) {
+			rbp := m.rbp()
+			counter1, err := DefineMonotonicCounter(rbp)
+			if err != nil {
+				t.Fatalf("Expected no error, got  \"%v\"", err)
+			}
 
-	counter2, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
-	if err != nil {
-		t.Fatalf("Expected no error on second call, got  \"%v\"", err)
-	}
+			counter2, err := DefineMonotonicCounter(rbp)
+			if err != nil {
+				t.Fatalf("Expected no error on second call, got  \"%v\"", err)
+			}
 
-	if counter1 != counter2 {
-		t.Fatalf("Expected same counter value on second call, got %d != %d", counter1, counter2)
+			if counter1 != counter2 {
+				t.Fatalf("Expected same counter value on second call, got %d != %d", counter1, counter2)
+			}
+		})
 	}
 }
 
 // TestDefineMonotonicCounterWrongNVType verifies that DefineMonotonicCounter
 // refuses to use an existing NV index whose type is not a counter.
 func TestDefineMonotonicCounterWrongNVType(t *testing.T) {
-	const wrongTypeHandle = uint32(0x1500018)
-
 	key, _ := genTpmKeyPairECC()
 	authorizationDigest, err := GenerateAuthDigest(&key.PublicKey)
 	if err != nil {
@@ -775,12 +808,12 @@ func TestDefineMonotonicCounterWrongNVType(t *testing.T) {
 	}
 
 	// plant an ordinary NV index at the handle.
-	err = SealSecret(wrongTypeHandle, authorizationDigest, []byte("dummy"))
+	err = SealSecret(NV_WRONG_TYPE_HANDLE, authorizationDigest, []byte("dummy"))
 	if err != nil {
 		t.Fatalf("Expected no error from SealSecret, got  \"%v\"", err)
 	}
 
-	_, err = DefineMonotonicCounter(wrongTypeHandle)
+	_, err = DefineMonotonicCounter(RBP{Counter: NV_WRONG_TYPE_HANDLE})
 	if err == nil {
 		t.Fatalf("Expected error when defining counter on ordinary NV handle, got nil")
 	}
@@ -833,7 +866,7 @@ func readAIKPublicKey(t *testing.T) crypto.PublicKey {
 func TestCertifyNVCounter(t *testing.T) {
 	aikPub := readAIKPublicKey(t)
 
-	counterVal, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	counterVal, err := DefineMonotonicCounter(RBP{Counter: NV_COUNTER_INDEX})
 	if err != nil {
 		t.Fatalf("DefineMonotonicCounter: %v", err)
 	}
@@ -868,12 +901,12 @@ func TestCertifyNVCounter(t *testing.T) {
 func TestVerifyNVCounterIncrementedValue(t *testing.T) {
 	aikPub := readAIKPublicKey(t)
 
-	_, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	_, err := DefineMonotonicCounter(RBP{Counter: NV_COUNTER_INDEX})
 	if err != nil {
 		t.Fatalf("DefineMonotonicCounter: %v", err)
 	}
 
-	incremented, err := IncreaseMonotonicCounter(NV_COUNTER_INDEX)
+	incremented, err := IncreaseMonotonicCounter(RBP{Counter: NV_COUNTER_INDEX})
 	if err != nil {
 		t.Fatalf("IncreaseMonotonicCounter: %v", err)
 	}
@@ -907,7 +940,7 @@ func TestVerifyNVCounterIncrementedValue(t *testing.T) {
 func TestVerifyNVCounterNonceMismatch(t *testing.T) {
 	aikPub := readAIKPublicKey(t)
 
-	_, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	_, err := DefineMonotonicCounter(RBP{Counter: NV_COUNTER_INDEX})
 	if err != nil {
 		t.Fatalf("DefineMonotonicCounter: %v", err)
 	}
@@ -936,7 +969,7 @@ func TestVerifyNVCounterNonceMismatch(t *testing.T) {
 // TestVerifyNVCounterWrongKey verifies that a cert signed by the AIK cannot
 // be verified with a different RSA key.
 func TestVerifyNVCounterWrongKey(t *testing.T) {
-	_, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	_, err := DefineMonotonicCounter(RBP{Counter: NV_COUNTER_INDEX})
 	if err != nil {
 		t.Fatalf("DefineMonotonicCounter: %v", err)
 	}
@@ -963,7 +996,7 @@ func TestVerifyNVCounterWrongKey(t *testing.T) {
 func TestVerifyNVCounterTamperedSignature(t *testing.T) {
 	aikPub := readAIKPublicKey(t)
 
-	_, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	_, err := DefineMonotonicCounter(RBP{Counter: NV_COUNTER_INDEX})
 	if err != nil {
 		t.Fatalf("DefineMonotonicCounter: %v", err)
 	}
@@ -1047,7 +1080,7 @@ func TestVerifyNVCounterECCMissingComponents(t *testing.T) {
 func TestVerifyNVCounterWrongNVName(t *testing.T) {
 	aikPub := readAIKPublicKey(t)
 
-	_, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	_, err := DefineMonotonicCounter(RBP{Counter: NV_COUNTER_INDEX})
 	if err != nil {
 		t.Fatalf("DefineMonotonicCounter: %v", err)
 	}

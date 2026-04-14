@@ -85,9 +85,51 @@ type PCRList struct {
 	Algo PCRHashAlgo
 }
 
+type CounterAuthMode int
+
+const (
+	// CounterAuthOwner uses the TPM Owner hierarchy to authorize counter
+	// operations. The counter is defined with AttrNVOwnerRead|AttrNVOwnerWrite.
+	// This requires the  caller to know the owner password
+	// (empty by default on fresh TPMs).
+	CounterAuthOwner = CounterAuthMode(0)
+
+	// CounterAuthIndex uses the NV index's own auth value (password) to
+	// authorize counter operations. The counter is defined with
+	// AttrNVAuthRead|AttrNVAuthWrite and all access goes through the index
+	// handle with the provided password. This decouples the counter from the
+	// Owner hierarchy, making it usable in environments where the owner
+	// password is unknown.
+	CounterAuthIndex = CounterAuthMode(1)
+)
+
 type RBP struct {
-	Counter uint32
-	Check   uint64
+	Counter  uint32
+	Check    uint64
+	AuthMode CounterAuthMode
+	Password []byte
+}
+
+// hasCounter reports whether this RBP carries a rollback protection counter.
+func (r RBP) hasCounter() bool { return r.Counter != 0 }
+
+// counterNVAttrs returns the NV attributes appropriate for this auth mode.
+func (r RBP) counterNVAttrs() tpm2.NVAttributes {
+	if r.AuthMode == CounterAuthIndex {
+		return tpm2.NVTypeCounter.WithAttrs(tpm2.AttrNVAuthRead | tpm2.AttrNVAuthWrite)
+	}
+	return tpm2.NVTypeCounter.WithAttrs(tpm2.AttrNVOwnerRead | tpm2.AttrNVOwnerWrite)
+}
+
+// counterAuthCtx returns the authorization context to use for counter
+// operations. For Owner mode this is the owner handle; for Index mode
+// it is the NV index itself with the password set as auth value.
+func (r RBP) counterAuthCtx(tpm *tpm2.TPMContext, index tpm2.ResourceContext) tpm2.ResourceContext {
+	if r.AuthMode == CounterAuthIndex {
+		index.SetAuthValue(r.Password)
+		return index
+	}
+	return tpm.OwnerHandleContext()
 }
 
 func getPCRAlgo(algo PCRHashAlgo) (tpm2.HashAlgorithmId, error) {
@@ -280,17 +322,19 @@ func authorizeObject(tpm *tpm2.TPMContext, publicKey crypto.PublicKey, sp Signed
 		}
 	}()
 
-	if rbp != (RBP{}) {
+	if rbp.hasCounter() {
 		index, err := tpm.NewResourceContext(tpm2.Handle(rbp.Counter))
 		if err != nil {
 			return nil, err
 		}
 
+		authCtx := rbp.counterAuthCtx(tpm, index)
+
 		// if rbp is provided, first check the PolicyNV then PolicyPCR, in this
 		// case the two policies form a logical AND (PolicyNV AND PolicyPCR).
 		operandB := make([]byte, 8)
 		binary.BigEndian.PutUint64(operandB, rbp.Check)
-		err = tpm.PolicyNV(tpm.OwnerHandleContext(), index, polss, operandB, 0, tpm2.OpUnsignedLE, nil)
+		err = tpm.PolicyNV(authCtx, index, polss, operandB, 0, tpm2.OpUnsignedLE, nil)
 		if err != nil {
 			return nil, err
 		}
@@ -319,7 +363,10 @@ func authorizeObject(tpm *tpm2.TPMContext, publicKey crypto.PublicKey, sp Signed
 
 // defineMonotonicCounterOn ensures the NV counter at handle exists and is
 // initialized on the given tpm connection, returning its current value.
-func defineMonotonicCounterOn(tpm *tpm2.TPMContext, handle uint32) (uint64, error) {
+func defineMonotonicCounterOn(tpm *tpm2.TPMContext, rbp RBP) (uint64, error) {
+	handle := rbp.Counter
+	expectedAttrs := rbp.counterNVAttrs()
+
 	index, err := tpm.NewResourceContext(tpm2.Handle(handle))
 	if err == nil {
 		// handle already exists, read its attributes.
@@ -333,20 +380,21 @@ func defineMonotonicCounterOn(tpm *tpm2.TPMContext, handle uint32) (uint64, erro
 		// the NV Name is a hash of the full public area, any extra bit
 		// would cause a policy digest mismatch between the policy creator
 		// and policy consumer.
-		expectedAttrs := tpm2.NVTypeCounter.WithAttrs(tpm2.AttrNVOwnerRead | tpm2.AttrNVOwnerWrite)
 		if nvpub.Attrs&^tpm2.AttrNVWritten != expectedAttrs {
 			return 0, errors.New("a counter at provide handle already exists with mismatched attributes")
 		}
 
+		authCtx := rbp.counterAuthCtx(tpm, index)
+
 		// if it's not initialized, initialize it by increasing it.
 		if (nvpub.Attrs & tpm2.AttrNVWritten) != tpm2.AttrNVWritten {
-			err = tpm.NVIncrement(tpm.OwnerHandleContext(), index, nil)
+			err = tpm.NVIncrement(authCtx, index, nil)
 			if err != nil {
 				return 0, err
 			}
 		}
 
-		counter, err := tpm.NVReadCounter(tpm.OwnerHandleContext(), index, nil)
+		counter, err := tpm.NVReadCounter(authCtx, index, nil)
 		if err != nil {
 			return 0, err
 		}
@@ -358,49 +406,57 @@ func defineMonotonicCounterOn(tpm *tpm2.TPMContext, handle uint32) (uint64, erro
 	nvpub := tpm2.NVPublic{
 		Index:   tpm2.Handle(handle),
 		NameAlg: tpm2.HashAlgorithmSHA256,
-		Attrs:   tpm2.NVTypeCounter.WithAttrs(tpm2.AttrNVOwnerRead | tpm2.AttrNVOwnerWrite),
+		Attrs:   expectedAttrs,
 		Size:    8}
-	index, err = tpm.NVDefineSpace(tpm.OwnerHandleContext(), nil, &nvpub, nil)
+	// NVDefineSpace always requires owner or platform auth.
+	index, err = tpm.NVDefineSpace(tpm.OwnerHandleContext(), rbp.Password, &nvpub, nil)
 	if err != nil {
 		return 0, err
 	}
+
+	authCtx := rbp.counterAuthCtx(tpm, index)
 
 	// increasing the counter is necessary to initialize it.
-	err = tpm.NVIncrement(tpm.OwnerHandleContext(), index, nil)
+	err = tpm.NVIncrement(authCtx, index, nil)
 	if err != nil {
 		return 0, err
 	}
 
-	return tpm.NVReadCounter(tpm.OwnerHandleContext(), index, nil)
+	return tpm.NVReadCounter(authCtx, index, nil)
 }
 
 // DefineMonotonicCounter will define a monotonic NV counter at the given index,
 // function will initialize the counter and returns its current value.
 //
-// monotonic counters will retain their value and won't go away even if undefined,
+// The rbp.AuthMode field controls the authorization model:
+//   - CounterAuthOwner (default): uses Owner hierarchy (AttrNVOwnerRead/Write).
+//   - CounterAuthIndex: uses the NV index's own auth value (AttrNVAuthRead/Write).
+//     rbp.Password is set as the auth value for the index.
+//
+// Monotonic counters will retain their value and won't go away even if undefined,
 // because of this if the handle already exist and it's attributes matches what
 // we need, it will get initialized first if it is uninitialized, and then
 // its current value is returned.
-func DefineMonotonicCounter(handle uint32) (uint64, error) {
+func DefineMonotonicCounter(rbp RBP) (uint64, error) {
 	tpm, err := getTpmHandle()
 	if err != nil {
 		return 0, err
 	}
 	defer tpm.Close()
 
-	return defineMonotonicCounterOn(tpm, handle)
+	return defineMonotonicCounterOn(tpm, rbp)
 }
 
 // IncreaseMonotonicCounter will increase the value of the monotonic counter at
 // provided index, by one and returns the new value.
-func IncreaseMonotonicCounter(handle uint32) (uint64, error) {
+func IncreaseMonotonicCounter(rbp RBP) (uint64, error) {
 	tpm, err := getTpmHandle()
 	if err != nil {
 		return 0, err
 	}
 	defer tpm.Close()
 
-	index, err := tpm.NewResourceContext(tpm2.Handle(handle))
+	index, err := tpm.NewResourceContext(tpm2.Handle(rbp.Counter))
 	if err != nil {
 		return 0, err
 	}
@@ -410,15 +466,17 @@ func IncreaseMonotonicCounter(handle uint32) (uint64, error) {
 		return 0, err
 	}
 	if nvpub.Attrs.Type() != tpm2.NVTypeCounter {
-		return 0, fmt.Errorf("NV index 0x%x is not a monotonic counter", handle)
+		return 0, fmt.Errorf("NV index 0x%x is not a monotonic counter", rbp.Counter)
 	}
 
-	err = tpm.NVIncrement(tpm.OwnerHandleContext(), index, nil)
+	authCtx := rbp.counterAuthCtx(tpm, index)
+
+	err = tpm.NVIncrement(authCtx, index, nil)
 	if err != nil {
 		return 0, err
 	}
 
-	counter, err := tpm.NVReadCounter(tpm.OwnerHandleContext(), index, nil)
+	counter, err := tpm.NVReadCounter(authCtx, index, nil)
 	if err != nil {
 		return 0, err
 	}
@@ -645,11 +703,11 @@ func GenerateSignedPolicy(privateKey crypto.PrivateKey, pcrList PCRList, rbp RBP
 	}
 	defer tpm.FlushContext(triss)
 
-	if rbp != (RBP{}) {
+	if rbp.hasCounter() {
 		// The trial session needs the NV index to exist on this TPM so it can
 		// compute the correct policy name. Create it on the same connection if
 		// it is not already present; value does not matter for name derivation.
-		if _, err := defineMonotonicCounterOn(tpm, rbp.Counter); err != nil {
+		if _, err := defineMonotonicCounterOn(tpm, rbp); err != nil {
 			return SignedPolicy{}, err
 		}
 
@@ -657,6 +715,8 @@ func GenerateSignedPolicy(privateKey crypto.PrivateKey, pcrList PCRList, rbp RBP
 		if err != nil {
 			return SignedPolicy{}, err
 		}
+
+		authCtx := rbp.counterAuthCtx(tpm, index)
 
 		// PolicyNV : index value <= operandB (check value)
 		// This is source of confusion, the reason for less than or equal
@@ -671,7 +731,7 @@ func GenerateSignedPolicy(privateKey crypto.PrivateKey, pcrList PCRList, rbp RBP
 		//  Old policy : check value = 5, device counter value = 6, 6 !<= 5policy no longer holds.
 		operandB := make([]byte, 8)
 		binary.BigEndian.PutUint64(operandB, rbp.Check)
-		err = tpm.PolicyNV(tpm.OwnerHandleContext(), index, triss, operandB, 0, tpm2.OpUnsignedLE, nil)
+		err = tpm.PolicyNV(authCtx, index, triss, operandB, 0, tpm2.OpUnsignedLE, nil)
 		if err != nil {
 			return SignedPolicy{}, err
 		}
