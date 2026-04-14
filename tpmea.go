@@ -654,7 +654,17 @@ func GenerateSignedPolicy(privateKey crypto.PrivateKey, pcrList PCRList, rbp RBP
 			return SignedPolicy{}, err
 		}
 
-		// PolicyNV : index value <= operandB
+		// PolicyNV : index value <= operandB (check value)
+		// This is source of confusion, the reason for less than or equal
+		// operator is to allow legitiate rollback has chance of sucess
+		// (i.e. update failiure), but when a new policy is applied sucessfully,
+		// device is expected to increase the counter value to match the check
+		// value, making older policy with smaller check value no longer valid.
+		// example:
+		//.  Old policy : check value = 5, device counter value = 5, 5 <= 5 policy holds.
+		//.  New policy : check value = 6, device counter value = 5, 5 <= 6 policy holds.
+		//   Device applies new policy, increases counter value to 6.
+		//  Old policy : check value = 5, device counter value = 6, 6 !<= 5policy no longer holds.
 		operandB := make([]byte, 8)
 		binary.BigEndian.PutUint64(operandB, rbp.Check)
 		err = tpm.PolicyNV(tpm.OwnerHandleContext(), index, triss, operandB, 0, tpm2.OpUnsignedLE, nil)
