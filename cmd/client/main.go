@@ -311,6 +311,7 @@ func toAPINVCert(c tpmea.NVCertification) *api.NVCert {
 		Nonce:      c.Nonce,
 		AttestBlob: c.AttestBlob,
 		NVName:     c.NVName,
+		SigHashAlg: c.SigHashAlg,
 		RSASig:     c.RSASig,
 		ECCSigR:    c.ECCSigR,
 		ECCSigS:    c.ECCSigS,
