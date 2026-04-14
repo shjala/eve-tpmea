@@ -54,9 +54,10 @@ func main() {
 	log.Println("  Passed")
 
 	step("create rollback protection counter")
-	counterVal, err := tpmea.DefineMonotonicCounter(nvCounterIndex)
+	rbp := tpmea.RBP{Counter: nvCounterIndex}
+	counterVal, err := tpmea.DefineMonotonicCounter(rbp)
 	must(err, "define counter")
-	rbp := tpmea.RBP{Counter: nvCounterIndex, Check: counterVal}
+	rbp.Check = counterVal
 	log.Printf("  counter value: %d", counterVal)
 
 	step("read current PCR values")
@@ -79,7 +80,7 @@ func main() {
 	log.Println("  Passed")
 
 	step("increment counter to match the signed policy")
-	counterVal, err = tpmea.IncreaseMonotonicCounter(nvCounterIndex)
+	counterVal, err = tpmea.IncreaseMonotonicCounter(rbp)
 	must(err, "increment counter")
 	if counterVal != newRBP.Check {
 		log.Fatalf("counter after increment %d does not match policy check %d", counterVal, newRBP.Check)
@@ -94,7 +95,7 @@ func main() {
 
 	step("increment counter then request new policy - old policy must be rejected")
 	oldSP, oldRBP := sp, rbp
-	counterVal, err = tpmea.IncreaseMonotonicCounter(nvCounterIndex)
+	counterVal, err = tpmea.IncreaseMonotonicCounter(rbp)
 	must(err, "increment counter")
 	rbp.Check = counterVal
 	nonce, err = c.nonce()
@@ -103,7 +104,7 @@ func main() {
 	must(err, "certify counter")
 	sp, newRBP, err = c.signPolicy(pcrList, rbp, cert)
 	must(err, "sign next counter policy")
-	counterVal, err = tpmea.IncreaseMonotonicCounter(nvCounterIndex)
+	counterVal, err = tpmea.IncreaseMonotonicCounter(rbp)
 	must(err, "increment counter to policy check")
 	if counterVal != newRBP.Check {
 		log.Fatalf("counter after increment %d does not match policy check %d", counterVal, newRBP.Check)
@@ -154,7 +155,7 @@ func main() {
 	checkEqual(secret, readSecret, "re-unseal")
 
 	step("increment counter - old policy must be rejected")
-	counterVal, err = tpmea.IncreaseMonotonicCounter(nvCounterIndex)
+	counterVal, err = tpmea.IncreaseMonotonicCounter(rbp)
 	must(err, "increment counter")
 	_, err = tpmea.UnsealSecret(nvIndex, publicKey, sp, sel, rbp)
 	if err == nil {
@@ -170,7 +171,7 @@ func main() {
 	must(err, "certify counter")
 	sp, newRBP, err = c.signPolicy(pcrList, rbp, cert)
 	must(err, "sign updated policy")
-	counterVal, err = tpmea.IncreaseMonotonicCounter(nvCounterIndex)
+	counterVal, err = tpmea.IncreaseMonotonicCounter(rbp)
 	must(err, "increment counter to policy check")
 	if counterVal != newRBP.Check {
 		log.Fatalf("counter after increment %d does not match policy check %d", counterVal, newRBP.Check)
@@ -302,7 +303,7 @@ func toAPIPCRList(l tpmea.PCRList) api.PCRList {
 }
 
 func toAPIRBP(r tpmea.RBP) api.RBP {
-	return api.RBP{Counter: r.Counter, Check: r.Check}
+	return api.RBP{Counter: r.Counter, Check: r.Check, AuthMode: int(r.AuthMode), Password: r.Password}
 }
 
 func toAPINVCert(c tpmea.NVCertification) *api.NVCert {

@@ -254,7 +254,7 @@ func fromAPIPCRList(a api.PCRList) tpmea.PCRList {
 }
 
 func fromAPIRBP(a api.RBP) tpmea.RBP {
-	return tpmea.RBP{Counter: a.Counter, Check: a.Check}
+	return tpmea.RBP{Counter: a.Counter, Check: a.Check, AuthMode: tpmea.CounterAuthMode(a.AuthMode), Password: a.Password}
 }
 
 func fromAPINVCert(a *api.NVCert) tpmea.NVCertification {
