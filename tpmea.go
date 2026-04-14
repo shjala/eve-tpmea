@@ -588,6 +588,142 @@ func UnsealSecret(handle uint32, publicKey crypto.PublicKey, sp SignedPolicy, se
 	return tpm.NVRead(index, index, pub.Size, 0, polss)
 }
 
+// aes128CFBSymDef returns the SymDef for AES-128-CFB, the standard symmetric
+// algorithm for TPM session-based parameter encryption.
+func aes128CFBSymDef() *tpm2.SymDef {
+	return &tpm2.SymDef{
+		Algorithm: tpm2.SymAlgorithmAES,
+		KeyBits:   &tpm2.SymKeyBitsU{Sym: 128},
+		Mode:      &tpm2.SymModeU{Sym: tpm2.SymModeCFB},
+	}
+}
+
+// startSaltedHMACSession creates a salted HMAC session with AES-128-CFB as the
+// symmetric algorithm for parameter encryption. saltKeyHandle is the handle of
+// an asymmetric decrypt key whose public part is used to encrypt the salt value.
+func startSaltedHMACSession(tpm *tpm2.TPMContext, saltKeyHandle uint32) (tpm2.SessionContext, error) {
+	saltKey, err := tpm.NewResourceContext(tpm2.Handle(saltKeyHandle))
+	if err != nil {
+		return nil, fmt.Errorf("cannot load salt key at 0x%08x: %w", saltKeyHandle, err)
+	}
+	return tpm.StartAuthSession(saltKey, nil, tpm2.SessionTypeHMAC, aes128CFBSymDef(), tpm2.HashAlgorithmSHA256)
+}
+
+// SealSecretEncrypted writes the secret to the TPM like SealSecret, but uses a
+// salted HMAC session with AES-128-CFB parameter encryption to protect the
+// secret on the CPU-TPM bus. saltKeyHandle is the handle of a loaded asymmetric
+// decrypt key (e.g. EK) used to establish the encrypted session.
+func SealSecretEncrypted(handle uint32, authDigest []byte, secret []byte, saltKeyHandle uint32) error {
+	if authDigest == nil || secret == nil {
+		return fmt.Errorf("invalid parameter(s)")
+	}
+	if len(authDigest) == 0 {
+		return fmt.Errorf("authDigest must not be empty: an empty policy allows unauthorized access")
+	}
+	if len(secret) == 0 {
+		return fmt.Errorf("secret must not be empty")
+	}
+
+	tpm, err := getTpmHandle()
+	if err != nil {
+		return err
+	}
+	defer tpm.Close()
+
+	nvBufMax, err := tpm.GetNVBufferMax()
+	if err != nil {
+		return fmt.Errorf("failed to query TPM_PT_NV_BUFFER_MAX: %w", err)
+	}
+	if len(secret) > nvBufMax {
+		return fmt.Errorf("secret too large: %d bytes exceeds TPM NV buffer max of %d", len(secret), nvBufMax)
+	}
+
+	// if the handle already exists, verify it is an ordinary NV index before
+	// overwriting it.
+	index, err := tpm.NewResourceContext(tpm2.Handle(handle))
+	if err == nil {
+		nvpub, _, err := tpm.NVReadPublic(index)
+		if err != nil {
+			return err
+		}
+		if nvpub.Attrs.Type() != tpm2.NVTypeOrdinary {
+			return fmt.Errorf("NV index 0x%x exists but is not an ordinary NV index (type: %v)", handle, nvpub.Attrs.Type())
+		}
+		err = tpm.NVUndefineSpace(tpm.OwnerHandleContext(), index, nil)
+		if err != nil {
+			return err
+		}
+	}
+
+	nvpub := tpm2.NVPublic{
+		Index:      tpm2.Handle(handle),
+		NameAlg:    tpm2.HashAlgorithmSHA256,
+		Attrs:      tpm2.NVTypeOrdinary.WithAttrs(tpm2.AttrNVPolicyRead | tpm2.AttrNVOwnerWrite | tpm2.AttrNVReadStClear),
+		AuthPolicy: authDigest,
+		Size:       uint16(len(secret))}
+	index, err = tpm.NVDefineSpace(tpm.OwnerHandleContext(), nil, &nvpub, nil)
+	if err != nil {
+		return err
+	}
+
+	// create a salted HMAC session with AES-128-CFB; the CommandEncrypt
+	// attribute tells the TPM to decrypt the first command parameter (the
+	// secret data) so it travels encrypted on the bus.
+	hmacSess, err := startSaltedHMACSession(tpm, saltKeyHandle)
+	if err != nil {
+		return fmt.Errorf("creating encrypted session: %w", err)
+	}
+	defer tpm.FlushContext(hmacSess)
+
+	encSess := hmacSess.WithAttrs(tpm2.AttrCommandEncrypt)
+	return tpm.NVWrite(tpm.OwnerHandleContext(), index, secret, 0, nil, encSess)
+}
+
+// UnsealSecretEncrypted reads the secret from the TPM like UnsealSecret, but
+// uses a salted HMAC session with AES-128-CFB parameter encryption to protect
+// the returned secret on the CPU-TPM bus. saltKeyHandle is the handle of a
+// loaded asymmetric decrypt key (e.g. EK) used to establish the encrypted
+// session.
+func UnsealSecretEncrypted(handle uint32, publicKey crypto.PublicKey, sp SignedPolicy, sel PCRSelection, rbp RBP, saltKeyHandle uint32) ([]byte, error) {
+	if publicKey == nil || sp.Sig == nil || sp.Digest == nil {
+		return nil, fmt.Errorf("invalid parameter(s)")
+	}
+
+	tpm, err := getTpmHandle()
+	if err != nil {
+		return nil, err
+	}
+	defer tpm.Close()
+
+	index, err := tpm.NewResourceContext(tpm2.Handle(handle))
+	if err != nil {
+		return nil, err
+	}
+
+	polss, err := authorizeObject(tpm, publicKey, sp, sel, rbp)
+	if err != nil {
+		return nil, err
+	}
+	defer tpm.FlushContext(polss)
+
+	pub, _, err := tpm.NVReadPublic(index)
+	if err != nil {
+		return nil, err
+	}
+
+	// create a salted HMAC session with AES-128-CFB; the ResponseEncrypt
+	// attribute tells the TPM to encrypt the first response parameter (the
+	// secret data) so it travels encrypted on the bus.
+	hmacSess, err := startSaltedHMACSession(tpm, saltKeyHandle)
+	if err != nil {
+		return nil, fmt.Errorf("creating encrypted session: %w", err)
+	}
+	defer tpm.FlushContext(hmacSess)
+
+	encSess := hmacSess.WithAttrs(tpm2.AttrResponseEncrypt)
+	return tpm.NVRead(index, index, pub.Size, 0, polss, encSess)
+}
+
 // ActivateReadLock prevents further reading of the data from provided index,
 // this restriction will gets deactivated on next tpm reset or restart.
 func ActivateReadLock(handle uint32, publicKey crypto.PublicKey, sp SignedPolicy, sel PCRSelection, rbp RBP) error {
