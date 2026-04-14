@@ -324,9 +324,13 @@ func defineMonotonicCounterOn(tpm *tpm2.TPMContext, handle uint32) (uint64, erro
 			return 0, err
 		}
 
-		// check if the type and attributes match what we need, if so, just use the handle.
-		attr := tpm2.AttrNVOwnerRead | tpm2.AttrNVOwnerWrite
-		if nvpub.Attrs.Type() != tpm2.NVTypeCounter || (nvpub.Attrs&attr) != attr {
+		// Strict equality check against the canonical attributes (minus
+		// AttrNVWritten bit, it set at runtime and checked next). Since
+		// the NV Name is a hash of the full public area, any extra bit
+		// would cause a policy digest mismatch between the policy creator
+		// and policy consumer.
+		expectedAttrs := tpm2.NVTypeCounter.WithAttrs(tpm2.AttrNVOwnerRead | tpm2.AttrNVOwnerWrite)
+		if nvpub.Attrs&^tpm2.AttrNVWritten != expectedAttrs {
 			return 0, errors.New("a counter at provide handle already exists with mismatched attributes")
 		}
 
