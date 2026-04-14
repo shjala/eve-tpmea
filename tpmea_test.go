@@ -838,6 +838,11 @@ func TestCertifyNVCounter(t *testing.T) {
 		t.Fatalf("DefineMonotonicCounter: %v", err)
 	}
 
+	nvName, err := ReadNVName(NV_COUNTER_INDEX)
+	if err != nil {
+		t.Fatalf("ReadNVName: %v", err)
+	}
+
 	nonce := make([]byte, 32)
 	if _, err := crand.Read(nonce); err != nil {
 		t.Fatalf("generate nonce: %v", err)
@@ -848,7 +853,7 @@ func TestCertifyNVCounter(t *testing.T) {
 		t.Fatalf("CertifyNVCounter: %v", err)
 	}
 
-	certified, err := VerifyNVCounter(&cert, aikPub, nonce)
+	certified, err := VerifyNVCounter(&cert, aikPub, nonce, nvName)
 	if err != nil {
 		t.Fatalf("VerifyNVCounter: %v", err)
 	}
@@ -873,6 +878,11 @@ func TestVerifyNVCounterIncrementedValue(t *testing.T) {
 		t.Fatalf("IncreaseMonotonicCounter: %v", err)
 	}
 
+	nvName, err := ReadNVName(NV_COUNTER_INDEX)
+	if err != nil {
+		t.Fatalf("ReadNVName: %v", err)
+	}
+
 	nonce := make([]byte, 32)
 	if _, err := crand.Read(nonce); err != nil {
 		t.Fatalf("generate nonce: %v", err)
@@ -883,7 +893,7 @@ func TestVerifyNVCounterIncrementedValue(t *testing.T) {
 		t.Fatalf("CertifyNVCounter: %v", err)
 	}
 
-	certified, err := VerifyNVCounter(&cert, aikPub, nonce)
+	certified, err := VerifyNVCounter(&cert, aikPub, nonce, nvName)
 	if err != nil {
 		t.Fatalf("VerifyNVCounter: %v", err)
 	}
@@ -917,7 +927,7 @@ func TestVerifyNVCounterNonceMismatch(t *testing.T) {
 		t.Fatalf("generate different nonce: %v", err)
 	}
 
-	_, err = VerifyNVCounter(&cert, aikPub, differentNonce)
+	_, err = VerifyNVCounter(&cert, aikPub, differentNonce, cert.NVName)
 	if err == nil {
 		t.Fatal("expected nonce mismatch error, got nil")
 	}
@@ -942,7 +952,7 @@ func TestVerifyNVCounterWrongKey(t *testing.T) {
 	}
 
 	wrongKey, _ := genTpmKeyPairRSA()
-	_, err = VerifyNVCounter(&cert, &wrongKey.PublicKey, nonce)
+	_, err = VerifyNVCounter(&cert, &wrongKey.PublicKey, nonce, cert.NVName)
 	if err == nil {
 		t.Fatal("expected signature verification error with wrong key, got nil")
 	}
@@ -970,22 +980,18 @@ func TestVerifyNVCounterTamperedSignature(t *testing.T) {
 
 	cert.RSASig[0] ^= 0xff
 
-	_, err = VerifyNVCounter(&cert, aikPub, nonce)
+	_, err = VerifyNVCounter(&cert, aikPub, nonce, cert.NVName)
 	if err == nil {
 		t.Fatal("expected signature verification error after tampering, got nil")
 	}
 }
 
-// TestVerifyNVCounterNilCert verifies that a nil cert skips all checks and
-// returns (0, nil) without any TPM interaction.
+// TestVerifyNVCounterNilCert verifies that a nil cert returns an error.
 func TestVerifyNVCounterNilCert(t *testing.T) {
 	key, _ := genTpmKeyPairRSA()
-	val, err := VerifyNVCounter(nil, &key.PublicKey, []byte("nonce"))
-	if err != nil {
-		t.Fatalf("expected nil error for nil cert, got %v", err)
-	}
-	if val != 0 {
-		t.Fatalf("expected 0 for nil cert, got %d", val)
+	_, err := VerifyNVCounter(nil, &key.PublicKey, []byte("nonce"), nil)
+	if err == nil {
+		t.Fatal("expected error for nil cert, got nil")
 	}
 }
 
@@ -993,7 +999,7 @@ func TestVerifyNVCounterNilCert(t *testing.T) {
 // RSA or ECDSA returns an error immediately.
 func TestVerifyNVCounterUnsupportedKeyType(t *testing.T) {
 	cert := NVCertification{AttestBlob: []byte("dummy")}
-	_, err := VerifyNVCounter(&cert, "not-a-real-key", []byte("nonce"))
+	_, err := VerifyNVCounter(&cert, "not-a-real-key", []byte("nonce"), nil)
 	if err == nil {
 		t.Fatal("expected error for unsupported key type, got nil")
 	}
@@ -1004,7 +1010,7 @@ func TestVerifyNVCounterUnsupportedKeyType(t *testing.T) {
 func TestVerifyNVCounterRSAMissingSignature(t *testing.T) {
 	key, _ := genTpmKeyPairRSA()
 	cert := NVCertification{AttestBlob: []byte("dummy")} // RSASig intentionally empty
-	_, err := VerifyNVCounter(&cert, &key.PublicKey, []byte("nonce"))
+	_, err := VerifyNVCounter(&cert, &key.PublicKey, []byte("nonce"), nil)
 	if err == nil {
 		t.Fatal("expected error for missing RSA signature, got nil")
 	}
@@ -1020,7 +1026,7 @@ func TestVerifyNVCounterECCMissingComponents(t *testing.T) {
 		ECCSigR:    []byte{0x01},
 		// ECCSigS intentionally absent
 	}
-	_, err := VerifyNVCounter(&certMissingS, &key.PublicKey, []byte("nonce"))
+	_, err := VerifyNVCounter(&certMissingS, &key.PublicKey, []byte("nonce"), nil)
 	if err == nil {
 		t.Fatal("expected error for missing ECDSA S component, got nil")
 	}
@@ -1030,8 +1036,35 @@ func TestVerifyNVCounterECCMissingComponents(t *testing.T) {
 		// ECCSigR intentionally absent
 		ECCSigS: []byte{0x01},
 	}
-	_, err = VerifyNVCounter(&certMissingR, &key.PublicKey, []byte("nonce"))
+	_, err = VerifyNVCounter(&certMissingR, &key.PublicKey, []byte("nonce"), nil)
 	if err == nil {
 		t.Fatal("expected error for missing ECDSA R component, got nil")
+	}
+}
+
+// TestVerifyNVCounterWrongNVName verifies that presenting a valid
+// certification but with a mismatched expected NV Name is rejected.
+func TestVerifyNVCounterWrongNVName(t *testing.T) {
+	aikPub := readAIKPublicKey(t)
+
+	_, err := DefineMonotonicCounter(NV_COUNTER_INDEX)
+	if err != nil {
+		t.Fatalf("DefineMonotonicCounter: %v", err)
+	}
+
+	nonce := make([]byte, 32)
+	if _, err := crand.Read(nonce); err != nil {
+		t.Fatalf("generate nonce: %v", err)
+	}
+
+	cert, err := CertifyNVCounter(AIK_HANDLE, NV_COUNTER_INDEX, nonce)
+	if err != nil {
+		t.Fatalf("CertifyNVCounter: %v", err)
+	}
+
+	wrongNVName := bytes.Repeat([]byte{0xAB}, 34) // wrong name
+	_, err = VerifyNVCounter(&cert, aikPub, nonce, wrongNVName)
+	if err == nil {
+		t.Fatal("expected NV name mismatch error, got nil")
 	}
 }

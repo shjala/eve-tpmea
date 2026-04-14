@@ -41,6 +41,10 @@ type NVCertification struct {
 	// AttestBlob is the raw marshaled TPMS_ATTEST structure. The signing
 	// key's signature covers SHA-256(AttestBlob).
 	AttestBlob []byte
+	// NVName is the TPM Name of the certified NV index, extracted from the
+	// attestation. Verifiers should compare it against an expected value to
+	// ensure the certification refers to the correct NV index.
+	NVName []byte
 	// RSASig is set when the signing key is RSA (PKCS#1v15).
 	RSASig []byte
 	// ECCSigR and ECCSigS are set when the signing key is ECDSA.
@@ -785,6 +789,28 @@ func ReadNVAuthDigest(handle uint32) ([]byte, error) {
 	return info.AuthPolicy, nil
 }
 
+// ReadNVName returns the TPM Name of the NV index at handle. The Name is a
+// cryptographic identifier derived from the full NV public area.
+func ReadNVName(handle uint32) ([]byte, error) {
+	tpm, err := getTpmHandle()
+	if err != nil {
+		return nil, err
+	}
+	defer tpm.Close()
+
+	index, err := tpm.NewResourceContext(tpm2.Handle(handle))
+	if err != nil {
+		return nil, err
+	}
+
+	_, name, err := tpm.NVReadPublic(index)
+	if err != nil {
+		return nil, err
+	}
+
+	return []byte(name), nil
+}
+
 // CertifyNVCounter runs TPM2_NV_Certify on the NV counter at nvHandle, signed
 // by the key at akHandle. nonce is a freshness token from the verifier; the
 // TPM embeds it in the attestation so replays can be detected.
@@ -812,7 +838,11 @@ func CertifyNVCounter(akHandle, nvHandle uint32, nonce []byte) (NVCertification,
 		return NVCertification{}, fmt.Errorf("marshal attest: %w", err)
 	}
 
-	cert := NVCertification{Nonce: nonce, AttestBlob: attestBytes}
+	cert := NVCertification{
+		Nonce:      nonce,
+		AttestBlob: attestBytes,
+		NVName:     []byte(attest.Attested.NV.IndexName),
+	}
 	switch sig.SigAlg {
 	case tpm2.SigSchemeAlgRSASSA:
 		cert.RSASig = []byte(sig.Signature.RSASSA.Sig)
@@ -827,10 +857,13 @@ func CertifyNVCounter(akHandle, nvHandle uint32, nonce []byte) (NVCertification,
 
 // VerifyNVCounter verifies that cert was produced by the TPM holding the key
 // whose public component is akPub and that the attestation is bound to nonce
-// (replay protection). It returns the certified counter value on success.
-func VerifyNVCounter(cert *NVCertification, akPub crypto.PublicKey, nonce []byte) (uint64, error) {
+// (replay protection). expectedNVName is the TPM Name of the NV index that
+// should appear in the attestation; if non-empty the function rejects
+// certifications for any other NV index, preventing index-substitution attacks.
+// It returns the certified counter value on success.
+func VerifyNVCounter(cert *NVCertification, akPub crypto.PublicKey, nonce []byte, expectedNVName []byte) (uint64, error) {
 	if cert == nil {
-		return 0, nil
+		return 0, fmt.Errorf("certification not provided")
 	}
 
 	digest := sha256.Sum256(cert.AttestBlob)
@@ -873,6 +906,14 @@ func VerifyNVCounter(cert *NVCertification, akPub crypto.PublicKey, nonce []byte
 	nvInfo := attest.Attested.NV
 	if nvInfo == nil {
 		return 0, errors.New("attestation missing NV certify info")
+	}
+	if len(expectedNVName) > 0 && !bytes.Equal([]byte(nvInfo.IndexName), expectedNVName) {
+		return 0, fmt.Errorf("NV index name mismatch: certified index has name %x, expected %x",
+			[]byte(nvInfo.IndexName), expectedNVName)
+	}
+	// verify the offset is strictly 0
+	if nvInfo.Offset != 0 {
+		return 0, fmt.Errorf("unexpected NV offset %d, want 0", nvInfo.Offset)
 	}
 	if len(nvInfo.NVContents) != 8 {
 		return 0, fmt.Errorf("unexpected NV contents length %d, want 8", len(nvInfo.NVContents))
