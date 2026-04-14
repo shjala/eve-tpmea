@@ -923,11 +923,7 @@ func VerifyNVCounter(cert *NVCertification, akPub crypto.PublicKey, nonce []byte
 }
 
 // nvCertify executes TPM2_NV_Certify.
-func nvCertify(
-	tpm *tpm2.TPMContext,
-	signCtx, authCtx, nvCtx tpm2.ResourceContext,
-	nonce []byte,
-) (*tpm2.Attest, *tpm2.Signature, error) {
+func nvCertify(tpm *tpm2.TPMContext, signCtx, authCtx, nvCtx tpm2.ResourceContext, nonce []byte) (*tpm2.Attest, *tpm2.Signature, error) {
 	inScheme := &tpm2.SigScheme{Scheme: tpm2.SigSchemeAlgNull}
 	var attest *tpm2.Attest
 	var sig *tpm2.Signature
@@ -937,7 +933,7 @@ func nvCertify(
 			tpm2.UseResourceContextWithAuth(authCtx, nil),
 			tpm2.UseHandleContext(nvCtx),
 		).
-		AddParams(tpm2.Data(nonce), inScheme, uint16(8), uint16(0)).
+		AddParams(tpm2.Data(nonce), inScheme, uint16(8), uint16(0)). // offset is 0, size is 8 for monotonic counter
 		Run(nil, mu.Sized(&attest), &sig)
 	if err != nil {
 		return nil, nil, fmt.Errorf("TPM2_NV_Certify: %w", err)
