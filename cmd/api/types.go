@@ -17,8 +17,10 @@ type PCRList struct {
 
 // RBP carries the rollback protection counter handle and expected value.
 type RBP struct {
-	Counter uint32 `json:"counter"`
-	Check   uint64 `json:"check"`
+	Counter  uint32 `json:"counter"`
+	Check    uint64 `json:"check"`
+	AuthMode int    `json:"authMode,omitempty"` // 0=owner, 1=index
+	Password []byte `json:"password,omitempty"`
 }
 
 // PolicySig holds the raw signature bytes from GenerateSignedPolicy.
