@@ -9,7 +9,8 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rsa"
-	"crypto/sha256"
+	_ "crypto/sha256"
+	_ "crypto/sha512"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -39,12 +40,16 @@ type NVCertification struct {
 	// embeds it in the signed blob so the verifier can confirm freshness.
 	Nonce []byte
 	// AttestBlob is the raw marshaled TPMS_ATTEST structure. The signing
-	// key's signature covers SHA-256(AttestBlob).
+	// key's signature covers hash(AttestBlob) using the algorithm in SigHashAlg.
 	AttestBlob []byte
 	// NVName is the TPM Name of the certified NV index, extracted from the
 	// attestation. Verifiers should compare it against an expected value to
 	// ensure the certification refers to the correct NV index.
 	NVName []byte
+	// SigHashAlg is the TPM hash algorithm ID (e.g. tpm2.HashAlgorithmSHA256)
+	// used to digest AttestBlob before signing. It is recorded so that
+	// VerifyNVCounter can use the correct hash without hardcoding SHA-256.
+	SigHashAlg uint16
 	// RSASig is set when the signing key is RSA (PKCS#1v15).
 	RSASig []byte
 	// ECCSigR and ECCSigS are set when the signing key is ECDSA.
@@ -902,6 +907,7 @@ func CertifyNVCounter(akHandle, nvHandle uint32, nonce []byte) (NVCertification,
 		Nonce:      nonce,
 		AttestBlob: attestBytes,
 		NVName:     []byte(attest.Attested.NV.IndexName),
+		SigHashAlg: uint16(sig.HashAlg()),
 	}
 	switch sig.SigAlg {
 	case tpm2.SigSchemeAlgRSASSA:
@@ -926,14 +932,21 @@ func VerifyNVCounter(cert *NVCertification, akPub crypto.PublicKey, nonce []byte
 		return 0, fmt.Errorf("certification not provided")
 	}
 
-	digest := sha256.Sum256(cert.AttestBlob)
+	hashAlg := tpm2.HashAlgorithmId(cert.SigHashAlg)
+	goHash := hashAlg.GetHash()
+	if !goHash.Available() {
+		return 0, fmt.Errorf("unsupported or unavailable hash algorithm 0x%04x", cert.SigHashAlg)
+	}
+	h := goHash.New()
+	h.Write(cert.AttestBlob)
+	digest := h.Sum(nil)
 
 	switch pub := akPub.(type) {
 	case *rsa.PublicKey:
 		if len(cert.RSASig) == 0 {
 			return 0, errors.New("RSA key but no RSA signature in certification")
 		}
-		if err := rsa.VerifyPKCS1v15(pub, crypto.SHA256, digest[:], cert.RSASig); err != nil {
+		if err := rsa.VerifyPKCS1v15(pub, goHash, digest, cert.RSASig); err != nil {
 			return 0, fmt.Errorf("signature verification failed: %w", err)
 		}
 	case *ecdsa.PublicKey:
@@ -942,7 +955,7 @@ func VerifyNVCounter(cert *NVCertification, akPub crypto.PublicKey, nonce []byte
 		}
 		r := new(big.Int).SetBytes(cert.ECCSigR)
 		s := new(big.Int).SetBytes(cert.ECCSigS)
-		if !ecdsa.Verify(pub, digest[:], r, s) {
+		if !ecdsa.Verify(pub, digest, r, s) {
 			return 0, errors.New("ECDSA signature verification failed")
 		}
 	default:
