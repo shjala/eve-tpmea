@@ -62,6 +62,7 @@ type NVCert struct {
 	Nonce      []byte `json:"nonce"`
 	AttestBlob []byte `json:"attestBlob"`
 	NVName     []byte `json:"nvName"`
+	SigHashAlg uint16 `json:"sigHashAlg"`
 	RSASig     []byte `json:"rsaSig,omitempty"`
 	ECCSigR    []byte `json:"eccSigR,omitempty"`
 	ECCSigS    []byte `json:"eccSigS,omitempty"`
