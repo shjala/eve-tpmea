@@ -20,13 +20,16 @@ import (
 )
 
 const (
-	RESETABLE_PCR_INDEX     = 16
-	NV_INDEX                = 0x1500016
-	NV_COUNTER_INDEX        = 0x1500017
-	NV_COUNTER_INDEX_AUTH   = 0x1500019 // counter with index-auth mode
-	NV_WRONG_TYPE_HANDLE    = 0x1500018
+	RESETABLE_PCR_INDEX   = 16
+	NV_INDEX              = 0x1500016
+	NV_COUNTER_INDEX      = 0x1500017
+	NV_COUNTER_INDEX_AUTH = 0x1500019 // counter with index-auth mode
+	NV_WRONG_TYPE_HANDLE  = 0x1500018
 	// AIK_HANDLE is the RSA restricted signing key provisioned by runtests.sh
 	AIK_HANDLE = uint32(0x81000003)
+	// EK_HANDLE is the RSA endorsement key (restricted|decrypt) provisioned
+	// by runtests.sh; used as the salt key for encrypted sessions.
+	EK_HANDLE = uint32(0x81000001)
 )
 
 var PCR_INDEXES = []int{0, 1, 2, 3, 4, 5}
@@ -1099,5 +1102,309 @@ func TestVerifyNVCounterWrongNVName(t *testing.T) {
 	_, err = VerifyNVCounter(&cert, aikPub, nonce, wrongNVName)
 	if err == nil {
 		t.Fatal("expected NV name mismatch error, got nil")
+	}
+}
+
+// The tests below exercise every combination of encrypted and plain
+// SealSecret / UnsealSecret, with both RSA and ECC signing keys.
+// The salt key for encrypted sessions is the EK at EK_HANDLE.
+//
+// sealFunc / unsealFunc abstract the seal/unseal call so the same test
+// body can be reused across encryption modes.
+type sealFunc func(handle uint32, authDigest []byte, secret []byte) error
+type unsealFunc func(handle uint32, publicKey crypto.PublicKey, sp SignedPolicy, sel PCRSelection, rbp RBP) ([]byte, error)
+
+func plainSeal(handle uint32, authDigest []byte, secret []byte) error {
+	return SealSecret(handle, authDigest, secret)
+}
+
+func encryptedSeal(handle uint32, authDigest []byte, secret []byte) error {
+	return SealSecretEncrypted(handle, authDigest, secret, EK_HANDLE)
+}
+
+func plainUnseal(handle uint32, publicKey crypto.PublicKey, sp SignedPolicy, sel PCRSelection, rbp RBP) ([]byte, error) {
+	return UnsealSecret(handle, publicKey, sp, sel, rbp)
+}
+
+func encryptedUnseal(handle uint32, publicKey crypto.PublicKey, sp SignedPolicy, sel PCRSelection, rbp RBP) ([]byte, error) {
+	return UnsealSecretEncrypted(handle, publicKey, sp, sel, rbp, EK_HANDLE)
+}
+
+var encryptionModes = []struct {
+	name   string
+	seal   sealFunc
+	unseal unsealFunc
+}{
+	{"plain_seal/plain_unseal", plainSeal, plainUnseal},
+	{"encrypted_seal/encrypted_unseal", encryptedSeal, encryptedUnseal},
+	{"encrypted_seal/plain_unseal", encryptedSeal, plainUnseal},
+	{"plain_seal/encrypted_unseal", plainSeal, encryptedUnseal},
+}
+
+// TestEncryptedSimpleSealUnsealRSA runs the simple seal/unseal flow with all
+// encryption combinations using an RSA signing key.
+func TestEncryptedSimpleSealUnsealRSA(t *testing.T) {
+	key, _ := genTpmKeyPairRSA()
+	for _, m := range encryptionModes {
+		t.Run(m.name, func(t *testing.T) {
+			testEncryptedSimpleSealUnseal(t, key, &key.PublicKey, m.seal, m.unseal)
+		})
+	}
+}
+
+// TestEncryptedSimpleSealUnsealECC runs the simple seal/unseal flow with all
+// encryption combinations using an ECC signing key.
+func TestEncryptedSimpleSealUnsealECC(t *testing.T) {
+	key, _ := genTpmKeyPairECC()
+	for _, m := range encryptionModes {
+		t.Run(m.name, func(t *testing.T) {
+			testEncryptedSimpleSealUnseal(t, key, &key.PublicKey, m.seal, m.unseal)
+		})
+	}
+}
+
+func testEncryptedSimpleSealUnseal(t *testing.T, privateKey crypto.PrivateKey, publicKey crypto.PublicKey, seal sealFunc, unseal unsealFunc) {
+	authorizationDigest, err := GenerateAuthDigest(publicKey)
+	if err != nil {
+		t.Fatalf("GenerateAuthDigest: %v", err)
+	}
+
+	for _, index := range PCR_INDEXES {
+		if err := extendPCR(index, AlgoSHA256, []byte("ENC_SEAL_EXTEND")); err != nil {
+			t.Fatalf("extendPCR: %v", err)
+		}
+	}
+
+	pcrs, err := readPCRs(PCR_INDEXES, AlgoSHA256)
+	if err != nil {
+		t.Fatalf("readPCRs: %v", err)
+	}
+
+	sealingPcrs := make(PCRS, 0)
+	for _, index := range PCR_INDEXES {
+		sealingPcrs = append(sealingPcrs, PCR{Index: pcrs.Pcrs[index].Index, Digest: pcrs.Pcrs[index].Digest})
+	}
+	pcrsList := PCRList{Algo: AlgoSHA256, Pcrs: sealingPcrs}
+
+	sp, err := GenerateSignedPolicy(privateKey, pcrsList, RBP{})
+	if err != nil {
+		t.Fatalf("GenerateSignedPolicy: %v", err)
+	}
+
+	writtenSecret := []byte("ENCRYPTED_SESSION_SECRET")
+	if err := seal(NV_INDEX, authorizationDigest, writtenSecret); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	sel := PCRSelection{Algo: AlgoSHA256, Indexes: PCR_INDEXES}
+	readSecret, err := unseal(NV_INDEX, publicKey, sp, sel, RBP{})
+	if err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+
+	if !bytes.Equal(writtenSecret, readSecret) {
+		t.Fatalf("secret mismatch: wrote %q, read %q", writtenSecret, readSecret)
+	}
+}
+
+// TestEncryptedMutablePolicySealUnsealRSA runs the mutable policy flow (seal,
+// unseal, PCR change, re-sign, unseal again) with all encryption combos.
+func TestEncryptedMutablePolicySealUnsealRSA(t *testing.T) {
+	for _, m := range encryptionModes {
+		t.Run(m.name, func(t *testing.T) {
+			key, _ := genTpmKeyPairRSA()
+			testEncryptedMutablePolicySealUnseal(t, key, &key.PublicKey, m.seal, m.unseal)
+		})
+	}
+}
+
+// TestEncryptedMutablePolicySealUnsealECC runs the mutable policy flow with
+// all encryption combos using ECC.
+func TestEncryptedMutablePolicySealUnsealECC(t *testing.T) {
+	for _, m := range encryptionModes {
+		t.Run(m.name, func(t *testing.T) {
+			key, _ := genTpmKeyPairECC()
+			testEncryptedMutablePolicySealUnseal(t, key, &key.PublicKey, m.seal, m.unseal)
+		})
+	}
+}
+
+func testEncryptedMutablePolicySealUnseal(t *testing.T, privateKey crypto.PrivateKey, publicKey crypto.PublicKey, seal sealFunc, unseal unsealFunc) {
+	authorizationDigest, err := GenerateAuthDigest(publicKey)
+	if err != nil {
+		t.Fatalf("GenerateAuthDigest: %v", err)
+	}
+
+	for _, index := range PCR_INDEXES {
+		if err := extendPCR(index, AlgoSHA256, []byte("ENC_MUTABLE_EXTEND")); err != nil {
+			t.Fatalf("extendPCR: %v", err)
+		}
+	}
+
+	pcrs, err := readPCRs(PCR_INDEXES, AlgoSHA256)
+	if err != nil {
+		t.Fatalf("readPCRs: %v", err)
+	}
+
+	sealingPcrs := make(PCRS, 0)
+	for _, index := range PCR_INDEXES {
+		sealingPcrs = append(sealingPcrs, PCR{Index: pcrs.Pcrs[index].Index, Digest: pcrs.Pcrs[index].Digest})
+	}
+	pcrsList := PCRList{Algo: AlgoSHA256, Pcrs: sealingPcrs}
+
+	sp, err := GenerateSignedPolicy(privateKey, pcrsList, RBP{})
+	if err != nil {
+		t.Fatalf("GenerateSignedPolicy: %v", err)
+	}
+
+	writtenSecret := []byte("ENC_MUTABLE_SECRET")
+	if err := seal(NV_INDEX, authorizationDigest, writtenSecret); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	sel := PCRSelection{Algo: AlgoSHA256, Indexes: PCR_INDEXES}
+	readSecret, err := unseal(NV_INDEX, publicKey, sp, sel, RBP{})
+	if err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	if !bytes.Equal(writtenSecret, readSecret) {
+		t.Fatalf("secret mismatch: wrote %q, read %q", writtenSecret, readSecret)
+	}
+
+	// extend a PCR to invalidate the current policy
+	pick := PCR_INDEXES[rand.Intn(len(PCR_INDEXES))]
+	if err := extendPCR(pick, AlgoSHA256, []byte("ENC_MUTABLE_EXTEND_2")); err != nil {
+		t.Fatalf("extendPCR: %v", err)
+	}
+
+	// unseal must fail with the old policy
+	_, err = unseal(NV_INDEX, publicKey, sp, sel, RBP{})
+	if err == nil {
+		t.Fatal("expected unseal to fail after PCR change, got nil")
+	}
+	if !strings.Contains(err.Error(), "TPM_RC_VALUE") {
+		t.Fatalf("expected TPM_RC_VALUE error, got %v", err)
+	}
+
+	// re-read PCRs and re-sign
+	pcrs, err = readPCRs(PCR_INDEXES, AlgoSHA256)
+	if err != nil {
+		t.Fatalf("readPCRs: %v", err)
+	}
+	sealingPcrs = make(PCRS, 0)
+	for _, index := range PCR_INDEXES {
+		sealingPcrs = append(sealingPcrs, PCR{Index: pcrs.Pcrs[index].Index, Digest: pcrs.Pcrs[index].Digest})
+	}
+	pcrsList = PCRList{Algo: AlgoSHA256, Pcrs: sealingPcrs}
+
+	sp, err = GenerateSignedPolicy(privateKey, pcrsList, RBP{})
+	if err != nil {
+		t.Fatalf("GenerateSignedPolicy: %v", err)
+	}
+
+	// unseal must succeed with the new policy
+	readSecret, err = unseal(NV_INDEX, publicKey, sp, sel, RBP{})
+	if err != nil {
+		t.Fatalf("Unseal after re-sign: %v", err)
+	}
+	if !bytes.Equal(writtenSecret, readSecret) {
+		t.Fatalf("secret mismatch after re-sign: wrote %q, read %q", writtenSecret, readSecret)
+	}
+}
+
+// TestEncryptedSealWithRollbackProtectionRSA exercises encrypted seal/unseal
+// together with rollback protection counters.
+func TestEncryptedSealWithRollbackProtectionRSA(t *testing.T) {
+	for _, m := range encryptionModes {
+		t.Run(m.name, func(t *testing.T) {
+			key, _ := genTpmKeyPairRSA()
+			testEncryptedSealWithRollbackProtection(t, key, &key.PublicKey, m.seal, m.unseal)
+		})
+	}
+}
+
+func TestEncryptedSealWithRollbackProtectionECC(t *testing.T) {
+	for _, m := range encryptionModes {
+		t.Run(m.name, func(t *testing.T) {
+			key, _ := genTpmKeyPairECC()
+			testEncryptedSealWithRollbackProtection(t, key, &key.PublicKey, m.seal, m.unseal)
+		})
+	}
+}
+
+func testEncryptedSealWithRollbackProtection(t *testing.T, privateKey crypto.PrivateKey, publicKey crypto.PublicKey, seal sealFunc, unseal unsealFunc) {
+	authorizationDigest, err := GenerateAuthDigest(publicKey)
+	if err != nil {
+		t.Fatalf("GenerateAuthDigest: %v", err)
+	}
+
+	for _, index := range PCR_INDEXES {
+		if err := extendPCR(index, AlgoSHA256, []byte("ENC_RBP_EXTEND")); err != nil {
+			t.Fatalf("extendPCR: %v", err)
+		}
+	}
+
+	rbp := RBP{Counter: NV_COUNTER_INDEX}
+	rbpCounter, err := DefineMonotonicCounter(rbp)
+	if err != nil {
+		t.Fatalf("DefineMonotonicCounter: %v", err)
+	}
+	rbp.Check = rbpCounter
+
+	pcrs, err := readPCRs(PCR_INDEXES, AlgoSHA256)
+	if err != nil {
+		t.Fatalf("readPCRs: %v", err)
+	}
+
+	sealingPcrs := make(PCRS, 0)
+	for _, index := range PCR_INDEXES {
+		sealingPcrs = append(sealingPcrs, PCR{Index: pcrs.Pcrs[index].Index, Digest: pcrs.Pcrs[index].Digest})
+	}
+	pcrsList := PCRList{Algo: AlgoSHA256, Pcrs: sealingPcrs}
+
+	sp, err := GenerateSignedPolicy(privateKey, pcrsList, rbp)
+	if err != nil {
+		t.Fatalf("GenerateSignedPolicy: %v", err)
+	}
+
+	writtenSecret := []byte("ENC_RBP_SECRET")
+	if err := seal(NV_INDEX, authorizationDigest, writtenSecret); err != nil {
+		t.Fatalf("Seal: %v", err)
+	}
+
+	sel := PCRSelection{Algo: AlgoSHA256, Indexes: PCR_INDEXES}
+	readSecret, err := unseal(NV_INDEX, publicKey, sp, sel, rbp)
+	if err != nil {
+		t.Fatalf("Unseal: %v", err)
+	}
+	if !bytes.Equal(writtenSecret, readSecret) {
+		t.Fatalf("secret mismatch: wrote %q, read %q", writtenSecret, readSecret)
+	}
+
+	// increment counter to invalidate the old policy
+	rbpCounter, err = IncreaseMonotonicCounter(rbp)
+	if err != nil {
+		t.Fatalf("IncreaseMonotonicCounter: %v", err)
+	}
+
+	// old policy should fail
+	_, err = unseal(NV_INDEX, publicKey, sp, sel, rbp)
+	if err == nil {
+		t.Fatal("expected unseal to fail after counter increment, got nil")
+	}
+
+	// re-sign with new counter value
+	rbp.Check = rbpCounter
+	sp, err = GenerateSignedPolicy(privateKey, pcrsList, rbp)
+	if err != nil {
+		t.Fatalf("GenerateSignedPolicy: %v", err)
+	}
+
+	readSecret, err = unseal(NV_INDEX, publicKey, sp, sel, rbp)
+	if err != nil {
+		t.Fatalf("Unseal after re-sign: %v", err)
+	}
+	if !bytes.Equal(writtenSecret, readSecret) {
+		t.Fatalf("secret mismatch after re-sign: wrote %q, read %q", writtenSecret, readSecret)
 	}
 }
