@@ -59,6 +59,7 @@ type NonceResp struct {
 type NVCert struct {
 	Nonce      []byte `json:"nonce"`
 	AttestBlob []byte `json:"attestBlob"`
+	NVName     []byte `json:"nvName"`
 	RSASig     []byte `json:"rsaSig,omitempty"`
 	ECCSigR    []byte `json:"eccSigR,omitempty"`
 	ECCSigS    []byte `json:"eccSigS,omitempty"`
@@ -81,4 +82,3 @@ type SignPolicyResp struct {
 	SignedPolicy SignedPolicy `json:"signedPolicy"`
 	NewRBP       RBP          `json:"newRbp"`
 }
-
